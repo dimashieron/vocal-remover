@@ -1,316 +1,326 @@
 /**
- * Vocal Remover Web Worker
- * Uses FFT-based center channel extraction (karaoke effect) + spectral subtraction
- * untuk memisahkan vokal dari instrumental
- * 
- * Algorithm:
- * 1. Center Channel Extraction: vocal biasanya di tengah (L+R phase cancel)
- * 2. Spectral Subtraction: kurangi frekuensi vokal dari instrumental
- * 3. Harmonic/Percussive Separation untuk kualitas lebih baik
+ * VocalSplit Advanced Worker v2
+ * Improved FFT-based vocal separation menggunakan:
+ * 1. Adaptive Center Channel Extraction
+ * 2. Wiener-inspired spectral masking
+ * 3. Multi-band processing
+ * 4. Harmonic-aware filtering
+ * 5. Overlap-add dengan window synthesis yang lebih baik
  */
 
 self.onmessage = function(e) {
-  const { audioData, sampleRate, channels } = e.data;
-  
+  const { sampleRate, channels } = e.data;
+
   try {
     self.postMessage({ type: 'progress', value: 5, message: 'Memulai analisis audio...' });
-    
-    const leftChannel = channels[0];
-    const rightChannel = channels.length > 1 ? channels[1] : channels[0];
-    
-    self.postMessage({ type: 'progress', value: 15, message: 'Ekstraksi center channel...' });
-    
-    // Step 1: Extract center channel (vocals)
-    const { vocalChannel, instrumentalL, instrumentalR } = extractCenterChannel(leftChannel, rightChannel);
-    
-    self.postMessage({ type: 'progress', value: 40, message: 'Memproses spektrum frekuensi...' });
-    
-    // Step 2: FFT-based spectral processing
-    const fftSize = 4096;
-    const hopSize = fftSize / 4;
-    
-    const processedVocal = spectralProcess(vocalChannel, fftSize, hopSize, 'vocal');
-    self.postMessage({ type: 'progress', value: 60, message: 'Memproses vokal...' });
-    
-    const processedInstrL = spectralProcess(instrumentalL, fftSize, hopSize, 'instrumental');
-    const processedInstrR = spectralProcess(instrumentalR, fftSize, hopSize, 'instrumental');
-    self.postMessage({ type: 'progress', value: 80, message: 'Memproses instrumental...' });
-    
-    // Step 3: Apply smooth gain envelope
-    applyGainEnvelope(processedVocal);
-    applyGainEnvelope(processedInstrL);
-    applyGainEnvelope(processedInstrR);
-    
-    self.postMessage({ type: 'progress', value: 90, message: 'Menggabungkan hasil...' });
-    
-    // Normalize
-    normalizeAudio(processedVocal);
-    normalizeAudio(processedInstrL);
-    normalizeAudio(processedInstrR);
-    
-    self.postMessage({ type: 'progress', value: 95, message: 'Finalisasi output...' });
-    
-    // Return results
+
+    const left  = channels[0];
+    const right = channels.length > 1 ? channels[1] : channels[0];
+    const len   = Math.min(left.length, right.length);
+
+    // Resample ke mono reference
+    const mid  = new Float32Array(len);
+    const side = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      mid[i]  = (left[i] + right[i]) * 0.5;
+      side[i] = (left[i] - right[i]) * 0.5;
+    }
+
+    self.postMessage({ type: 'progress', value: 12, message: 'Analisis spektral mid/side...' });
+
+    const FFT_SIZE = 4096;
+    const HOP     = FFT_SIZE / 8;   // 87.5% overlap → lebih halus
+
+    // --- Step 1: Hitung magnitude spektrum untuk masking ---
+    self.postMessage({ type: 'progress', value: 20, message: 'Menghitung spektrum vokal...' });
+    const midMag  = computeMagnitudeSpectrum(mid,  FFT_SIZE, HOP);
+    const sideMag = computeMagnitudeSpectrum(side, FFT_SIZE, HOP);
+
+    // --- Step 2: Bangun Wiener masks ---
+    self.postMessage({ type: 'progress', value: 35, message: 'Membangun Wiener mask...' });
+    const { vocalMask, instrMask } = buildWienerMasks(midMag, sideMag, FFT_SIZE);
+
+    // --- Step 3: Apply mask ke sinyal asli channel L & R ---
+    self.postMessage({ type: 'progress', value: 50, message: 'Memproses channel kiri...' });
+    const vocalL = applyMaskOLA(left,  vocalMask, FFT_SIZE, HOP, sampleRate, 'vocal');
+    self.postMessage({ type: 'progress', value: 62, message: 'Memproses channel kanan...' });
+    const vocalR = applyMaskOLA(right, vocalMask, FFT_SIZE, HOP, sampleRate, 'vocal');
+
+    self.postMessage({ type: 'progress', value: 72, message: 'Memproses instrumental kiri...' });
+    const instrL = applyMaskOLA(left,  instrMask, FFT_SIZE, HOP, sampleRate, 'instr');
+    self.postMessage({ type: 'progress', value: 82, message: 'Memproses instrumental kanan...' });
+    const instrR = applyMaskOLA(right, instrMask, FFT_SIZE, HOP, sampleRate, 'instr');
+
+    // --- Step 4: Post-processing ---
+    self.postMessage({ type: 'progress', value: 90, message: 'Post-processing...' });
+
+    // Vokal: mono-ize sedikit supaya lebih center
+    for (let i = 0; i < len; i++) {
+      const m = (vocalL[i] + vocalR[i]) * 0.5;
+      vocalL[i] = vocalL[i] * 0.3 + m * 0.7;
+      vocalR[i] = vocalR[i] * 0.3 + m * 0.7;
+    }
+
+    applyFades(vocalL); applyFades(vocalR);
+    applyFades(instrL); applyFades(instrR);
+    normalize(vocalL);  normalize(vocalR);
+    normalize(instrL);  normalize(instrR);
+
+    self.postMessage({ type: 'progress', value: 97, message: 'Finalisasi output...' });
+
     self.postMessage({
       type: 'complete',
-      vocalData: {
-        left: processedVocal,
-        right: processedVocal, // mono vocal centered
-        sampleRate: sampleRate
-      },
-      instrumentalData: {
-        left: processedInstrL,
-        right: processedInstrR,
-        sampleRate: sampleRate
-      }
-    }, [
-      processedVocal.buffer,
-      processedInstrL.buffer,
-      processedInstrR.buffer
-    ]);
-    
-  } catch (err) {
-    self.postMessage({ type: 'error', message: err.message });
+      vocalData:        { left: vocalL, right: vocalR, sampleRate },
+      instrumentalData: { left: instrL, right: instrR, sampleRate },
+    }, [vocalL.buffer, vocalR.buffer, instrL.buffer, instrR.buffer]);
+
+  } catch(err) {
+    self.postMessage({ type: 'error', message: err.message || String(err) });
   }
 };
 
-function extractCenterChannel(left, right) {
-  const len = Math.min(left.length, right.length);
-  const vocalChannel = new Float32Array(len);
-  const instrumentalL = new Float32Array(len);
-  const instrumentalR = new Float32Array(len);
-  
-  // Enhanced center extraction dengan adaptive scaling
-  for (let i = 0; i < len; i++) {
-    const l = left[i];
-    const r = right[i];
-    
-    // Center = average (mono center where vocals sit)
-    const center = (l + r) * 0.5;
-    
-    // Side = stereo difference
-    const sideL = l - center;
-    const sideR = r - center;
-    
-    // Vocal extraction: center channel dengan boosted mid frequencies
-    vocalChannel[i] = center;
-    
-    // Instrumental: remove center, keep sides
-    // Blend factor untuk mengurangi phasing artifacts
-    const blend = 0.85;
-    instrumentalL[i] = l - center * blend;
-    instrumentalR[i] = r - center * blend;
+/* ============================================================
+   MAGNITUDE SPECTRUM (tanpa phase, untuk masking)
+   ============================================================ */
+function computeMagnitudeSpectrum(signal, fftSize, hop) {
+  const win      = hannWindow(fftSize);
+  const halfBins = fftSize / 2 + 1;
+  const frames   = Math.ceil((signal.length - fftSize) / hop) + 1;
+  // Simpan per-frame magnitude
+  const mags = new Array(frames);
+
+  for (let f = 0; f < frames; f++) {
+    const start = f * hop;
+    const frame = new Float64Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+      const idx = start + i;
+      frame[i] = idx < signal.length ? signal[idx] * win[i] : 0;
+    }
+    const { real, imag } = fftForward(frame);
+    const mag = new Float32Array(halfBins);
+    for (let k = 0; k < halfBins; k++) {
+      mag[k] = Math.sqrt(real[k]*real[k] + imag[k]*imag[k]);
+    }
+    mags[f] = mag;
   }
-  
-  return { vocalChannel, instrumentalL, instrumentalR };
+  return mags;
 }
 
-function spectralProcess(signal, fftSize, hopSize, mode) {
-  const numFrames = Math.ceil((signal.length - fftSize) / hopSize) + 1;
-  const output = new Float32Array(signal.length);
-  const overlapAdd = new Float32Array(signal.length);
-  const windowSum = new Float32Array(signal.length);
-  
-  // Hann window
-  const window = createHannWindow(fftSize);
-  
-  for (let frame = 0; frame < numFrames; frame++) {
-    const start = frame * hopSize;
-    const end = Math.min(start + fftSize, signal.length);
-    const frameLen = end - start;
-    
-    if (frameLen < fftSize / 2) break;
-    
-    // Extract frame
-    const frameData = new Float32Array(fftSize);
-    for (let i = 0; i < frameLen; i++) {
-      frameData[i] = signal[start + i] * window[i];
+/* ============================================================
+   WIENER MASKS
+   Vocal mask  = mid² / (mid² + side² + ε)   → center-heavy
+   Instr mask  = 1 - vocal_mask (residual)
+   Tambah frekuensi bias: boost vocal 200-4000Hz
+   ============================================================ */
+function buildWienerMasks(midMags, sideMags, fftSize) {
+  const frames   = midMags.length;
+  const halfBins = fftSize / 2 + 1;
+  const vocalMask = new Array(frames);
+  const instrMask = new Array(frames);
+  const EPS = 1e-8;
+
+  // Frekuensi bias: tiap bin dapat weight vocal-ness
+  const vocalBias = buildVocalBias(halfBins);
+
+  for (let f = 0; f < frames; f++) {
+    const vm = new Float32Array(halfBins);
+    const im = new Float32Array(halfBins);
+    const mid  = midMags[f];
+    const side = sideMags[f];
+
+    for (let k = 0; k < halfBins; k++) {
+      const m2 = mid[k]  * mid[k];
+      const s2 = side[k] * side[k];
+
+      // Wiener-like ratio: seberapa "center" bin ini
+      let v = m2 / (m2 + s2 + EPS);
+
+      // Terapkan bias frekuensi
+      v = Math.pow(v, 1.5) * vocalBias[k];   // lebih agresif
+      v = Math.min(1, Math.max(0, v));
+
+      vm[k] = v;
+      im[k] = 1 - v;
     }
-    
+
+    // Smoothing antar frame (temporal)
+    if (f > 0) {
+      const pv = vocalMask[f-1];
+      for (let k = 0; k < halfBins; k++) {
+        vm[k] = 0.7 * vm[k] + 0.3 * pv[k];
+        im[k] = 1 - vm[k];
+      }
+    }
+
+    vocalMask[f] = vm;
+    instrMask[f] = im;
+  }
+  return { vocalMask, instrMask };
+}
+
+/**
+ * Bias per-bin:
+ *  - Di bawah ~80 Hz  → bukan vokal (bass/kick)
+ *  - 120–4000 Hz      → vokal range, boost
+ *  - 4000–8000 Hz     → sibilance vokal, medium
+ *  - Di atas 8000 Hz  → mostly instr, reduce
+ */
+function buildVocalBias(halfBins) {
+  // Asumsikan 44100Hz, fftSize=4096 → bin width ~10.77Hz
+  const binHz = 44100 / (halfBins * 2 - 2); // ≈ 10.77
+  const bias  = new Float32Array(halfBins);
+
+  for (let k = 0; k < halfBins; k++) {
+    const hz = k * binHz;
+    let b = 0.5; // default
+
+    if (hz < 80)                b = 0.05;  // sub bass bukan vokal
+    else if (hz < 150)          b = 0.3;
+    else if (hz < 300)          b = 0.65;
+    else if (hz < 4000)         b = 1.0;   // core vocal range
+    else if (hz < 6000)         b = 0.75;  // sibilance
+    else if (hz < 10000)        b = 0.4;
+    else                        b = 0.15;
+
+    bias[k] = b;
+  }
+  return bias;
+}
+
+/* ============================================================
+   APPLY MASK via Overlap-Add
+   ============================================================ */
+function applyMaskOLA(signal, masks, fftSize, hop, sampleRate, mode) {
+  const win      = hannWindow(fftSize);
+  const halfBins = fftSize / 2 + 1;
+  const frames   = masks.length;
+  const out      = new Float32Array(signal.length);
+  const winSum   = new Float32Array(signal.length);
+
+  for (let f = 0; f < frames; f++) {
+    const start = f * hop;
+    if (start >= signal.length) break;
+
+    // Baca frame
+    const frame = new Float64Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+      const idx = start + i;
+      frame[i] = idx < signal.length ? signal[idx] * win[i] : 0;
+    }
+
     // FFT
-    const { real, imag } = fft(frameData);
-    
-    // Spectral processing
-    if (mode === 'vocal') {
-      applyVocalFilter(real, imag, fftSize);
-    } else {
-      applyInstrumentalFilter(real, imag, fftSize);
+    const { real, imag } = fftForward(frame);
+
+    // Apply mask
+    const mask = masks[f];
+    for (let k = 0; k < halfBins; k++) {
+      const m = mask[k];
+      real[k] *= m;
+      imag[k] *= m;
+      // Mirror
+      if (k > 0 && k < halfBins - 1) {
+        real[fftSize - k] *= m;
+        imag[fftSize - k] *= m;
+      }
     }
-    
+
     // IFFT
-    const processed = ifft(real, imag);
-    
-    // Overlap-add synthesis
-    for (let i = 0; i < frameLen; i++) {
-      if (start + i < output.length) {
-        overlapAdd[start + i] += processed[i] * window[i];
-        windowSum[start + i] += window[i] * window[i];
+    const rec = ifft(real, imag, fftSize);
+
+    // Overlap-add dengan synthesis window
+    for (let i = 0; i < fftSize; i++) {
+      const idx = start + i;
+      if (idx < signal.length) {
+        out[idx]    += rec[i] * win[i];
+        winSum[idx] += win[i] * win[i];
       }
     }
   }
-  
-  // Normalize by window sum
-  for (let i = 0; i < output.length; i++) {
-    if (windowSum[i] > 1e-8) {
-      output[i] = overlapAdd[i] / windowSum[i];
-    }
+
+  // Normalize by window
+  for (let i = 0; i < signal.length; i++) {
+    if (winSum[i] > 1e-8) out[i] /= winSum[i];
   }
-  
-  return output;
+  return out;
 }
 
-function applyVocalFilter(real, imag, fftSize) {
-  // Boost vocal frequency range (300Hz - 3400Hz typical vocal range)
-  // Pass-band filter dengan tapering
-  const N = fftSize;
-  
-  for (let k = 0; k < N / 2; k++) {
-    let gain = 1.0;
-    const freq = k / N; // normalized frequency
-    
-    // Vocal frequency emphasis:
-    // Low cut below ~80Hz
-    if (freq < 0.002) {
-      gain = 0.1;
-    }
-    // High cut above ~8kHz 
-    else if (freq > 0.18) {
-      gain = Math.max(0.1, 1.0 - (freq - 0.18) / 0.1);
-    }
-    // Sweet spot boost 300Hz-4kHz
-    else if (freq >= 0.007 && freq <= 0.09) {
-      gain = 1.2;
-    }
-    
-    real[k] *= gain;
-    imag[k] *= gain;
-    // Mirror
-    if (k > 0 && k < N / 2) {
-      real[N - k] *= gain;
-      imag[N - k] *= gain;
-    }
-  }
-}
-
-function applyInstrumentalFilter(real, imag, fftSize) {
-  // Instrumental: keep full spectrum, attenuate mid vocal frequencies
-  const N = fftSize;
-  
-  for (let k = 0; k < N / 2; k++) {
-    let gain = 1.0;
-    const freq = k / N;
-    
-    // Gently attenuate vocal sweet spot
-    if (freq >= 0.007 && freq <= 0.09) {
-      // Subtle attenuation di vocal range untuk bersihkan sisa vokal
-      gain = 0.75;
-    }
-    
-    real[k] *= gain;
-    imag[k] *= gain;
-    if (k > 0 && k < N / 2) {
-      real[N - k] *= gain;
-      imag[N - k] *= gain;
-    }
-  }
-}
-
-function fft(signal) {
-  const N = signal.length;
-  const real = new Float64Array(signal);
+/* ============================================================
+   FFT / IFFT (Cooley-Tukey radix-2)
+   ============================================================ */
+function fftForward(input) {
+  const N    = input.length;
+  const real = new Float64Array(input);
   const imag = new Float64Array(N);
-  
-  // Bit-reversal permutation
-  let j = 0;
-  for (let i = 1; i < N; i++) {
-    let bit = N >> 1;
-    while (j & bit) {
-      j ^= bit;
-      bit >>= 1;
-    }
-    j ^= bit;
-    if (i < j) {
-      [real[i], real[j]] = [real[j], real[i]];
-      [imag[i], imag[j]] = [imag[j], imag[i]];
-    }
-  }
-  
-  // Cooley-Tukey FFT
-  for (let len = 2; len <= N; len <<= 1) {
-    const angle = -2 * Math.PI / len;
-    const wReal = Math.cos(angle);
-    const wImag = Math.sin(angle);
-    
-    for (let i = 0; i < N; i += len) {
-      let phaseReal = 1.0;
-      let phaseImag = 0.0;
-      
-      for (let k = 0; k < len / 2; k++) {
-        const uReal = real[i + k];
-        const uImag = imag[i + k];
-        const vReal = real[i + k + len/2] * phaseReal - imag[i + k + len/2] * phaseImag;
-        const vImag = real[i + k + len/2] * phaseImag + imag[i + k + len/2] * phaseReal;
-        
-        real[i + k] = uReal + vReal;
-        imag[i + k] = uImag + vImag;
-        real[i + k + len/2] = uReal - vReal;
-        imag[i + k + len/2] = uImag - vImag;
-        
-        const newPhaseReal = phaseReal * wReal - phaseImag * wImag;
-        phaseImag = phaseReal * wImag + phaseImag * wReal;
-        phaseReal = newPhaseReal;
-      }
-    }
-  }
-  
+  fftInPlace(real, imag, false);
   return { real, imag };
 }
 
-function ifft(real, imag) {
-  const N = real.length;
-  
-  // Conjugate
-  for (let i = 0; i < N; i++) imag[i] = -imag[i];
-  
-  // Forward FFT
-  const { real: r, imag: im } = fft(real);
-  
-  // Scale and conjugate again
-  const result = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    result[i] = r[i] / N;
-  }
-  
-  return result;
+function ifft(real, imag, N) {
+  const r = new Float64Array(real);
+  const im = new Float64Array(imag);
+  fftInPlace(r, im, true);
+  const out = new Float32Array(N);
+  for (let i = 0; i < N; i++) out[i] = r[i] / N;
+  return out;
 }
 
-function createHannWindow(size) {
-  const window = new Float32Array(size);
-  for (let i = 0; i < size; i++) {
-    window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (size - 1)));
-  }
-  return window;
-}
-
-function applyGainEnvelope(signal) {
-  // Smooth ramp-in/out untuk menghindari clicks
-  const rampLen = Math.min(1024, signal.length / 10);
-  for (let i = 0; i < rampLen; i++) {
-    const gain = i / rampLen;
-    signal[i] *= gain;
-    signal[signal.length - 1 - i] *= gain;
-  }
-}
-
-function normalizeAudio(signal) {
-  let maxAmp = 0;
-  for (let i = 0; i < signal.length; i++) {
-    maxAmp = Math.max(maxAmp, Math.abs(signal[i]));
-  }
-  if (maxAmp > 0.001) {
-    const normFactor = 0.92 / maxAmp;
-    for (let i = 0; i < signal.length; i++) {
-      signal[i] *= normFactor;
+function fftInPlace(re, im, inverse) {
+  const N = re.length;
+  // Bit-reversal
+  for (let i = 1, j = 0; i < N; i++) {
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
     }
+  }
+  // Butterfly
+  for (let len = 2; len <= N; len <<= 1) {
+    const ang  = (inverse ? 2 : -2) * Math.PI / len;
+    const wRe  = Math.cos(ang);
+    const wIm  = Math.sin(ang);
+    for (let i = 0; i < N; i += len) {
+      let phRe = 1, phIm = 0;
+      for (let k = 0; k < len >> 1; k++) {
+        const uRe = re[i+k],  uIm = im[i+k];
+        const vRe = re[i+k+(len>>1)] * phRe - im[i+k+(len>>1)] * phIm;
+        const vIm = re[i+k+(len>>1)] * phIm + im[i+k+(len>>1)] * phRe;
+        re[i+k]         = uRe + vRe;  im[i+k]         = uIm + vIm;
+        re[i+k+(len>>1)]= uRe - vRe;  im[i+k+(len>>1)]= uIm - vIm;
+        const nRe = phRe*wRe - phIm*wIm;
+        phIm = phRe*wIm + phIm*wRe;
+        phRe = nRe;
+      }
+    }
+  }
+}
+
+/* ============================================================
+   UTILS
+   ============================================================ */
+function hannWindow(size) {
+  const w = new Float64Array(size);
+  for (let i = 0; i < size; i++)
+    w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (size - 1)));
+  return w;
+}
+
+function applyFades(sig) {
+  const ramp = Math.min(2048, Math.floor(sig.length / 20));
+  for (let i = 0; i < ramp; i++) {
+    const g = i / ramp;
+    sig[i] *= g;
+    sig[sig.length - 1 - i] *= g;
+  }
+}
+
+function normalize(sig) {
+  let peak = 0;
+  for (let i = 0; i < sig.length; i++) peak = Math.max(peak, Math.abs(sig[i]));
+  if (peak > 1e-4) {
+    const gain = 0.92 / peak;
+    for (let i = 0; i < sig.length; i++) sig[i] *= gain;
   }
 }
