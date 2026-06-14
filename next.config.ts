@@ -8,8 +8,8 @@ const nextConfig: NextConfig = {
   },
   // basePath untuk GitHub Pages: /repository-name
   // Biarkan kosong dulu, user bisa sesuaikan
-  // basePath: '/vocal-remover',
-  // assetPrefix: '/vocal-remover/',
+  basePath: '/vocal-remover',
+  assetPrefix: '/vocal-remover/',
 };
 
 export default nextConfig;
